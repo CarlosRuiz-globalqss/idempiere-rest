@@ -44,8 +44,10 @@ import java.util.logging.Level;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import javax.ws.rs.core.Context;
 import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
+import javax.ws.rs.core.UriInfo;
 import javax.xml.bind.DatatypeConverter;
 
 import org.adempiere.base.event.EventHelper;
@@ -75,6 +77,7 @@ import org.compiere.util.DefaultEvaluatee.DataProvider;
 import org.compiere.util.DisplayType;
 import org.compiere.util.Env;
 import org.compiere.util.Evaluator;
+import org.compiere.model.MSysConfig;
 import org.compiere.util.MimeType;
 import org.compiere.util.Msg;
 import org.compiere.util.Trx;
@@ -104,6 +107,7 @@ import com.trekglobal.idempiere.rest.api.model.MRestViewColumn;
 import com.trekglobal.idempiere.rest.api.model.MRestViewRelated;
 import com.trekglobal.idempiere.rest.api.util.ErrorBuilder;
 import com.trekglobal.idempiere.rest.api.util.ThreadLocalTrx;
+import com.trekglobal.idempiere.rest.api.v1.auth.filter.PresignedURL;
 import com.trekglobal.idempiere.rest.api.v1.resource.ModelResource;
 import com.trekglobal.idempiere.rest.api.v1.resource.WindowResource;
 import com.trekglobal.idempiere.rest.api.v1.resource.file.FileStreamingOutput;
@@ -118,6 +122,11 @@ public class ModelResourceImpl implements ModelResource {
 	
 	public static final String PO_BEFORE_REST_SAVE = "idempiere-rest/po/beforeSave";
 	public static final String PO_AFTER_REST_SAVE = "idempiere-rest/po/afterSave";
+
+	private static final String REST_PRESIGNED_URL_MAX_EXPIRE_SECONDS = "REST_PRESIGNED_URL_MAX_EXPIRE_SECONDS";
+
+	@Context
+	private UriInfo uriInfo;
 
 	private boolean useRestView = false;
 	
@@ -967,7 +976,7 @@ public class ModelResourceImpl implements ModelResource {
 				if (archive.getAD_Process_ID() > 0)
 					entryJsonObject.addProperty("processId", archive.getAD_Process_ID());
 				if (archive.getCreated() != null)
-					entryJsonObject.addProperty("created", archive.getCreated().toString());
+					entryJsonObject.addProperty("created", archive.getCreated().toInstant().toString());
 				array.add(entryJsonObject);
 			}
 			JsonObject json = new JsonObject();
@@ -979,7 +988,8 @@ public class ModelResourceImpl implements ModelResource {
 	}
 
 	@Override
-	public Response getArchiveEntry(String tableName, String id, int archiveId, String asJson) {
+	public Response getArchiveEntry(String tableName, String id, int archiveId, String asJson, String presign, long expiresInSeconds) {
+		String originalTableName = tableName;
 		MRestView view = null;
 		if (useRestView) {
 			view = RestUtils.getView(tableName);
@@ -996,6 +1006,24 @@ public class ModelResourceImpl implements ModelResource {
 					.setParameters(archiveId, po.get_Table_ID(), po.get_ID())
 					.first();
 			if (archive != null) {
+				if ("true".equalsIgnoreCase(presign)) {
+					int maxExpire = MSysConfig.getIntValue(REST_PRESIGNED_URL_MAX_EXPIRE_SECONDS, 3600);
+					if (expiresInSeconds <= 0 || expiresInSeconds > maxExpire)
+						expiresInSeconds = maxExpire;
+					String nativeUrl = archive.getPresignedURL(expiresInSeconds);
+					if (nativeUrl != null) {
+						JsonObject json = new JsonObject();
+						json.addProperty("url", nativeUrl);
+						return Response.ok(json.toString(), "application/json").build();
+					}
+					String archivePrefix = useRestView ? "v1/views/" : "v1/models/"; // no leading slash - same pattern as UploadResourceImpl
+					String archivePath = archivePrefix + originalTableName + "/" + id + "/archives/" + archiveId;
+					String presignedURLParams = PresignedURL.createPresignedURLParams("GET", archivePath, expiresInSeconds);
+					String baseUrl = uriInfo.getBaseUri().toString();
+					JsonObject json = new JsonObject();
+					json.addProperty("url", baseUrl + archivePath + presignedURLParams);
+					return Response.ok(json.toString(), "application/json").build();
+				}
 				byte[] binaryData = archive.getBinaryData();
 				if (binaryData != null) {
 					if (asJson == null) {
